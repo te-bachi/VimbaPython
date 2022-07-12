@@ -842,6 +842,111 @@ class Frame:
         self._frame.imageSize = img_size
         self._frame.pixelFormat = target_fmt
 
+
+
+    @RuntimeTypeCheckEnable()
+    # https://peps.python.org/pep-0484/#forward-references
+    def copy_as(self, target_fmt: PixelFormat) -> 'Frame':
+        global BAYER_PIXEL_FORMATS
+
+        # 0) deepcopy the whole frame
+        frame_copy = copy.deepcopy(self)
+
+        # 1) Perform sanity checking
+        fmt = self.get_pixel_format()
+
+        if fmt == target_fmt:
+            return
+
+        if target_fmt not in fmt.get_convertible_formats():
+            raise ValueError('Current PixelFormat can\'t be converted into given format.')
+
+        # 2) Specify Transformation Input Image
+        height = self._frame.height
+        width = self._frame.width
+
+        c_src_image = VmbImage()
+        c_src_image.Size = sizeof(c_src_image)
+        c_src_image.Data = ctypes.cast(self._buffer, ctypes.c_void_p)
+
+        call_vimba_image_transform('VmbSetImageInfoFromPixelFormat', fmt, width, height,
+                                   byref(c_src_image))
+
+        # 3) Specify Transformation Output Image
+        c_dst_image = VmbImage()
+        c_dst_image.Size = sizeof(c_dst_image)
+
+        layout, bits = PIXEL_FORMAT_TO_LAYOUT[VmbPixelFormat(target_fmt)]
+
+        call_vimba_image_transform('VmbSetImageInfoFromInputImage', byref(c_src_image), layout,
+                                   bits, byref(c_dst_image))
+
+        # 4) Allocate Buffer and perform transformation
+        img_size = int(height * width * c_dst_image.ImageInfo.PixelInfo.BitsPerPixel / 8)
+        anc_size = self._frame.ancillarySize
+
+        buf = (ctypes.c_ubyte * (img_size + anc_size))()
+        c_dst_image.Data = ctypes.cast(buf, ctypes.c_void_p)
+
+        # 8) Update frame metadata
+        frame_copy._buffer = buf
+        frame_copy._frame.buffer = ctypes.cast(frame_copy._buffer, ctypes.c_void_p)
+        frame_copy._frame.bufferSize = sizeof(frame_copy._buffer)
+        frame_copy._frame.imageSize = img_size
+        frame_copy._frame.pixelFormat = target_fmt
+
+        return frame_copy
+
+    @RuntimeTypeCheckEnable()
+    # https://peps.python.org/pep-0484/#forward-references
+    def convert_to(self, dst_frame: 'Frame',
+                   debayer_mode: Optional[Debayer] = None):
+
+        # 1) Perform sanity checking [PART]
+        fmt = self.get_pixel_format()
+
+        # 2) Specify Transformation Input Image
+        height = self._frame.height
+        width = self._frame.width
+
+        c_src_image = VmbImage()
+        c_src_image.Size = sizeof(c_src_image)
+        c_src_image.Data = ctypes.cast(self._buffer, ctypes.c_void_p)
+
+        call_vimba_image_transform('VmbSetImageInfoFromPixelFormat', fmt, width, height,
+                                   byref(c_src_image))
+
+        # 3) Specify Transformation Output Image
+        c_dst_image = VmbImage()
+        c_dst_image.Size = sizeof(c_dst_image)
+        c_dst_image.Data = ctypes.cast(dst_frame._buffer, ctypes.c_void_p)
+
+        layout, bits = PIXEL_FORMAT_TO_LAYOUT[VmbPixelFormat(dst_frame._frame.pixelFormat)]
+
+        call_vimba_image_transform('VmbSetImageInfoFromInputImage', byref(c_src_image), layout,
+                                   bits, byref(c_dst_image))
+
+        # 4) Allocate Buffer and perform transformation [PART]
+        img_size = int(height * width * c_dst_image.ImageInfo.PixelInfo.BitsPerPixel / 8)
+        anc_size = self._frame.ancillarySize
+
+        # 5) Setup Debayering mode if given.
+        transform_info = VmbTransformInfo()
+        if debayer_mode and (fmt in BAYER_PIXEL_FORMATS):
+            call_vimba_image_transform('VmbSetDebayerMode', VmbDebayerMode(debayer_mode),
+                                       byref(transform_info))
+
+        # 6) Perform Transformation
+        call_vimba_image_transform('VmbImageTransform', byref(c_src_image), byref(c_dst_image),
+                                   byref(transform_info), 1)
+
+        # 7) Copy ancillary data if existing
+        if anc_size:
+            src = ctypes.addressof(self._buffer) + self._frame.imageSize
+            dst = ctypes.addressof(dst_frame._buffer) + img_size
+
+            ctypes.memmove(dst, src, anc_size)
+
     def as_numpy_ndarray(self) -> 'numpy.ndarray':
         """Construct numpy.ndarray view on VimbaFrame.
 
